@@ -21,9 +21,19 @@ async fn spawn_test_server() -> SocketAddr {
 
 fn pcm16le_silence(duration_ms: u64) -> Vec<u8> {
     let n_samples = (16_000 * duration_ms / 1000) as usize;
+    vec![0u8; n_samples * 2]
+}
+
+/// A sine tone at fixed amplitude, well above the VAD's RMS threshold, so
+/// tests can simulate "speech" without needing a real audio sample.
+fn pcm16le_sine(duration_ms: u64, freq_hz: f32) -> Vec<u8> {
+    let n_samples = (16_000 * duration_ms / 1000) as usize;
     let mut bytes = Vec::with_capacity(n_samples * 2);
-    for _ in 0..n_samples {
-        bytes.extend_from_slice(&0i16.to_le_bytes());
+    for i in 0..n_samples {
+        let t = i as f32 / 16_000.0;
+        let sample = (t * freq_hz * 2.0 * std::f32::consts::PI).sin() * 0.5;
+        let value = (sample * i16::MAX as f32) as i16;
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
 }
@@ -43,7 +53,7 @@ async fn next_json(
 }
 
 #[tokio::test]
-async fn stream_emits_partial_then_final() {
+async fn stream_emits_partial_after_silence_then_final_on_stop() {
     let addr = spawn_test_server().await;
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/stream"))
         .await
@@ -55,10 +65,12 @@ async fn stream_emits_partial_then_final() {
     .await
     .unwrap();
 
-    // 1s of silence == exactly one fixed-interval chunk -> one partial.
-    ws.send(WsMessage::Binary(pcm16le_silence(1000)))
-        .await
-        .unwrap();
+    // 500ms of "speech" followed by 500ms of silence: the trailing silence
+    // (well past the 400ms hang threshold) should make the VAD cut a chunk
+    // on its own, without waiting for `stop`.
+    let mut audio = pcm16le_sine(500, 440.0);
+    audio.extend(pcm16le_silence(500));
+    ws.send(WsMessage::Binary(audio)).await.unwrap();
 
     let partial = next_json(&mut ws).await;
     assert_eq!(partial["type"], "partial");
@@ -69,6 +81,29 @@ async fn stream_emits_partial_then_final() {
 
     let final_msg = next_json(&mut ws).await;
     assert_eq!(final_msg["type"], "final");
+}
+
+#[tokio::test]
+async fn stream_hard_cap_cuts_continuous_speech_without_pause() {
+    let addr = spawn_test_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/stream"))
+        .await
+        .unwrap();
+
+    ws.send(WsMessage::Text(
+        r#"{"type":"start","sample_rate":16000,"channels":1}"#.to_string(),
+    ))
+    .await
+    .unwrap();
+
+    // 5.5s of continuous speech with no pause: the VAD never sees trailing
+    // silence, so only the 5s hard cap should force a cut.
+    ws.send(WsMessage::Binary(pcm16le_sine(5_500, 440.0)))
+        .await
+        .unwrap();
+
+    let partial = next_json(&mut ws).await;
+    assert_eq!(partial["type"], "partial");
 }
 
 #[tokio::test]

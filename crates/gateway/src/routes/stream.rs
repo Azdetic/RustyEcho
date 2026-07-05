@@ -18,10 +18,21 @@ use tokio::time::timeout;
 use crate::state::AppState;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Fixed-interval placeholder chunking. Real VAD-based chunking is
-/// deferred to Milestone 4 once actual inference latency is known
-/// (see planning.md — the "right" chunk size depends on it).
-const CHUNK_DURATION_MS: u64 = 1000;
+
+const FRAME_MS: u64 = 20;
+const FRAME_SAMPLES: usize = (AudioFormat::TARGET.sample_rate as u64 * FRAME_MS / 1000) as usize;
+/// RMS threshold (on samples normalized to -1.0..=1.0) below which a frame
+/// counts as silence. Not calibrated against real speech/noise — a
+/// placeholder to validate the chunking pipeline, same caveat as the
+/// fixed-interval version it replaces.
+const SILENCE_RMS_THRESHOLD: f32 = 0.02;
+/// Trailing silence frames required after detected speech before a chunk
+/// is cut and handed to the `Transcriber`. 20 * 20ms = 400ms.
+const SILENCE_HANG_FRAMES: usize = 20;
+/// Hard cap on buffered audio so continuous speech with no pauses still
+/// gets cut somewhere, bounding worst-case latency and memory per connection.
+const MAX_BUFFER_MS: u64 = 5000;
+const MAX_BUFFER_SAMPLES: usize = (AudioFormat::TARGET.sample_rate as u64 * MAX_BUFFER_MS / 1000) as usize;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -49,9 +60,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
-    let chunk_len_samples =
-        (AudioFormat::TARGET.sample_rate as u64 * CHUNK_DURATION_MS / 1000) as usize;
-    let mut pcm_buf: Vec<f32> = Vec::new();
+    let mut vad = EnergyVad::new();
 
     loop {
         let msg = match timeout(IDLE_TIMEOUT, receiver.next()).await {
@@ -65,9 +74,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         match msg {
             Message::Binary(bytes) => {
-                append_pcm16le(&mut pcm_buf, &bytes);
-                while pcm_buf.len() >= chunk_len_samples {
-                    let chunk: Vec<f32> = pcm_buf.drain(..chunk_len_samples).collect();
+                if let Some(chunk) = vad.push(&bytes) {
                     if emit_result(&state, &mut sender, chunk, false).await.is_err() {
                         return;
                     }
@@ -78,7 +85,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     serde_json::from_str::<ClientMessage>(&text),
                     Ok(ClientMessage::Stop)
                 ) {
-                    let remaining = std::mem::take(&mut pcm_buf);
+                    let remaining = vad.take();
                     let _ = emit_result(&state, &mut sender, remaining, true).await;
                     break;
                 }
@@ -129,6 +136,71 @@ async fn handshake(
             false
         }
     }
+}
+
+/// Minimal energy-based voice activity detector: cuts a chunk once speech
+/// has been seen followed by `SILENCE_HANG_FRAMES` of near-silence, or once
+/// `MAX_BUFFER_SAMPLES` is reached regardless of silence. This is a
+/// Milestone 4 placeholder for the fixed-interval chunker — see
+/// planning.md: the "correct" strategy depends on real inference latency,
+/// which only exists once Phase 2 swaps in a real `Transcriber`.
+struct EnergyVad {
+    buf: Vec<f32>,
+    analyzed_samples: usize,
+    has_speech: bool,
+    trailing_silence_frames: usize,
+}
+
+impl EnergyVad {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            analyzed_samples: 0,
+            has_speech: false,
+            trailing_silence_frames: 0,
+        }
+    }
+
+    /// Appends raw PCM16LE bytes; returns a chunk ready for transcription
+    /// if a cut point was reached.
+    fn push(&mut self, bytes: &[u8]) -> Option<Vec<f32>> {
+        append_pcm16le(&mut self.buf, bytes);
+
+        while self.analyzed_samples + FRAME_SAMPLES <= self.buf.len() {
+            let frame = &self.buf[self.analyzed_samples..self.analyzed_samples + FRAME_SAMPLES];
+            if rms(frame) >= SILENCE_RMS_THRESHOLD {
+                self.has_speech = true;
+                self.trailing_silence_frames = 0;
+            } else {
+                self.trailing_silence_frames += 1;
+            }
+            self.analyzed_samples += FRAME_SAMPLES;
+        }
+
+        let silence_hang_reached =
+            self.has_speech && self.trailing_silence_frames >= SILENCE_HANG_FRAMES;
+        let hard_cap_reached = self.buf.len() >= MAX_BUFFER_SAMPLES;
+
+        if silence_hang_reached || hard_cap_reached {
+            Some(self.take())
+        } else {
+            None
+        }
+    }
+
+    /// Takes whatever is buffered — used for VAD-triggered cuts and for the
+    /// final flush on `stop` — and resets state for the next chunk.
+    fn take(&mut self) -> Vec<f32> {
+        self.analyzed_samples = 0;
+        self.has_speech = false;
+        self.trailing_silence_frames = 0;
+        std::mem::take(&mut self.buf)
+    }
+}
+
+fn rms(frame: &[f32]) -> f32 {
+    let sum_sq: f32 = frame.iter().map(|s| s * s).sum();
+    (sum_sq / frame.len() as f32).sqrt()
 }
 
 fn append_pcm16le(buf: &mut Vec<f32>, bytes: &[u8]) {
