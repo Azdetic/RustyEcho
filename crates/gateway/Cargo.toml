@@ -1,0 +1,21 @@
+[package]
+name = "rustyecho-gateway"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+rustyecho-core = { path = "../core" }
+rustyecho-audio = { path = "../audio" }
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["limit", "trace"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+hound = "3"
