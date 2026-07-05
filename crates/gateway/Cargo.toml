@@ -6,10 +6,11 @@ edition.workspace = true
 [dependencies]
 rustyecho-core = { path = "../core" }
 rustyecho-audio = { path = "../audio" }
-axum = { version = "0.7", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+axum = { version = "0.7", features = ["multipart", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["limit", "trace"] }
+futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -19,3 +20,4 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
 hound = "3"
+tokio-tungstenite = "0.24"

@@ -17,6 +17,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/transcriptions",
             post(routes::transcriptions::create_transcription),
         )
+        .route("/v1/stream", get(routes::stream::stream_handler))
         .layer(RequestBodyLimitLayer::new(max_upload_bytes))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
