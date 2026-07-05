@@ -21,16 +21,17 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const FRAME_MS: u64 = 20;
 const FRAME_SAMPLES: usize = (AudioFormat::TARGET.sample_rate as u64 * FRAME_MS / 1000) as usize;
-/// RMS threshold (on samples normalized to -1.0..=1.0) below which a frame
-/// counts as silence. Not calibrated against real speech/noise — a
-/// placeholder to validate the chunking pipeline, same caveat as the
-/// fixed-interval version it replaces.
+/// RMS threshold on samples normalized to -1.0..=1.0 below which a frame
+/// counts as silence
+/// Not calibrated against real speech and noise just a
+/// placeholder to validate the chunking pipeline with the same caveat as the
+/// fixed interval version it replaces
 const SILENCE_RMS_THRESHOLD: f32 = 0.02;
 /// Trailing silence frames required after detected speech before a chunk
-/// is cut and handed to the `Transcriber`. 20 * 20ms = 400ms.
+/// is cut and handed to the `Transcriber` 20 * 20ms = 400ms
 const SILENCE_HANG_FRAMES: usize = 20;
 /// Hard cap on buffered audio so continuous speech with no pauses still
-/// gets cut somewhere, bounding worst-case latency and memory per connection.
+/// gets cut somewhere to bound worst case latency and memory per connection
 const MAX_BUFFER_MS: u64 = 5000;
 const MAX_BUFFER_SAMPLES: usize = (AudioFormat::TARGET.sample_rate as u64 * MAX_BUFFER_MS / 1000) as usize;
 
@@ -96,11 +97,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 }
 
-/// Reads the first client message and validates it is a `start` handshake
-/// declaring exactly the format every `Transcriber` expects. Phase 1
-/// intentionally does not resample inside the streaming path (unlike the
-/// batch `/v1/transcriptions` endpoint) — the client must send 16kHz mono
-/// PCM16LE directly.
+/// Reads the first client message and validates it is a start handshake
+/// declaring exactly the format every Transcriber expects
+/// Phase 1 intentionally does not resample inside the streaming path unlike the
+/// batch /v1/transcriptions endpoint so the client must send 16kHz mono
+/// PCM16LE directly
 async fn handshake(
     sender: &mut SplitSink<WebSocket, Message>,
     receiver: &mut SplitStream<WebSocket>,
@@ -138,12 +139,12 @@ async fn handshake(
     }
 }
 
-/// Minimal energy-based voice activity detector: cuts a chunk once speech
-/// has been seen followed by `SILENCE_HANG_FRAMES` of near-silence, or once
-/// `MAX_BUFFER_SAMPLES` is reached regardless of silence. This is a
-/// Milestone 4 placeholder for the fixed-interval chunker — see
-/// planning.md: the "correct" strategy depends on real inference latency,
-/// which only exists once Phase 2 swaps in a real `Transcriber`.
+/// Minimal energy based voice activity detector cuts a chunk once speech
+/// has been seen followed by SILENCE_HANG_FRAMES of near silence or once
+/// MAX_BUFFER_SAMPLES is reached regardless of silence
+/// This is a Milestone 4 placeholder for the fixed interval chunker see
+/// planning.md because the correct strategy depends on real inference latency
+/// which only exists once Phase 2 swaps in a real Transcriber
 struct EnergyVad {
     buf: Vec<f32>,
     analyzed_samples: usize,
@@ -161,8 +162,8 @@ impl EnergyVad {
         }
     }
 
-    /// Appends raw PCM16LE bytes; returns a chunk ready for transcription
-    /// if a cut point was reached.
+    /// Appends raw PCM16LE bytes and returns a chunk ready for transcription
+    /// if a cut point was reached
     fn push(&mut self, bytes: &[u8]) -> Option<Vec<f32>> {
         append_pcm16le(&mut self.buf, bytes);
 
@@ -188,8 +189,8 @@ impl EnergyVad {
         }
     }
 
-    /// Takes whatever is buffered — used for VAD-triggered cuts and for the
-    /// final flush on `stop` — and resets state for the next chunk.
+    /// Takes whatever is buffered used for VAD triggered cuts and for the
+    /// final flush on stop and resets state for the next chunk
     fn take(&mut self) -> Vec<f32> {
         self.analyzed_samples = 0;
         self.has_speech = false;

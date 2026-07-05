@@ -24,8 +24,8 @@ fn pcm16le_silence(duration_ms: u64) -> Vec<u8> {
     vec![0u8; n_samples * 2]
 }
 
-/// A sine tone at fixed amplitude, well above the VAD's RMS threshold, so
-/// tests can simulate "speech" without needing a real audio sample.
+/// A sine tone at fixed amplitude well above the VAD RMS threshold so
+/// tests can simulate speech without needing a real audio sample
 fn pcm16le_sine(duration_ms: u64, freq_hz: f32) -> Vec<u8> {
     let n_samples = (16_000 * duration_ms / 1000) as usize;
     let mut bytes = Vec::with_capacity(n_samples * 2);
@@ -65,9 +65,9 @@ async fn stream_emits_partial_after_silence_then_final_on_stop() {
     .await
     .unwrap();
 
-    // 500ms of "speech" followed by 500ms of silence: the trailing silence
-    // (well past the 400ms hang threshold) should make the VAD cut a chunk
-    // on its own, without waiting for `stop`.
+    // 500ms of speech followed by 500ms of silence where the trailing silence
+    // well past the 400ms hang threshold should make the VAD cut a chunk
+    // on its own without waiting for stop
     let mut audio = pcm16le_sine(500, 440.0);
     audio.extend(pcm16le_silence(500));
     ws.send(WsMessage::Binary(audio)).await.unwrap();
@@ -96,8 +96,8 @@ async fn stream_hard_cap_cuts_continuous_speech_without_pause() {
     .await
     .unwrap();
 
-    // 5.5s of continuous speech with no pause: the VAD never sees trailing
-    // silence, so only the 5s hard cap should force a cut.
+    // 5.5s of continuous speech with no pause where the VAD never sees trailing
+    // silence so only the 5s hard cap should force a cut
     ws.send(WsMessage::Binary(pcm16le_sine(5_500, 440.0)))
         .await
         .unwrap();
@@ -131,7 +131,7 @@ async fn stream_rejects_missing_handshake() {
         .await
         .unwrap();
 
-    // Sending binary audio before the start handshake is invalid.
+    // Sending binary audio before the start handshake is invalid
     ws.send(WsMessage::Binary(pcm16le_silence(100)))
         .await
         .unwrap();
@@ -143,7 +143,7 @@ async fn stream_rejects_missing_handshake() {
             assert_eq!(json["type"], "error");
         }
         // Server closing the connection outright is also an acceptable
-        // rejection of a malformed handshake.
+        // rejection of a malformed handshake
         Ok(Some(Err(_))) | Ok(None) => {}
         Err(_) => panic!("server neither responded nor closed the connection"),
     }

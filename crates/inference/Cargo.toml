@@ -1,0 +1,22 @@
+[package]
+name = "rustyecho-inference"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+rustyecho-core = { path = "../core" }
+anyhow = "1"
+byteorder = "1.5.0"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+hf-hub = "0.5.0"
+serde_json.workspace = true
+tokenizers = "0.23.1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+rustyecho-audio = { path = "../audio" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

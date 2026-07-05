@@ -1,12 +1,13 @@
-//! Manual load/spike harness for `/v1/stream` — NOT part of the automated
-//! test suite (see planning.md Milestone 4). Run against a real server:
+//! Manual load spike harness for `/v1/stream` not part of the automated
+//! test suite see planning.md Milestone 4
+//! Run against a real server
 //!
 //!   cargo run -p rustyecho-gateway --release
 //!   cargo run -p rustyecho-gateway --example load_test --release -- 100 20 ws://127.0.0.1:8080/v1/stream
 //!
-//! while watching the server process's memory/CPU in a separate terminal.
+//! Watch the server process memory and CPU in a separate terminal
 //! This produces real numbers for the roadmap benchmark table instead of
-//! unverified claims.
+//! unverified claims
 
 use std::time::{Duration, Instant};
 

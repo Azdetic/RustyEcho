@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use rustyecho_core::MockTranscriber;
 use rustyecho_gateway::{app::build_router, state::AppState};
+use rustyecho_inference::WhisperTranscriber;
 
 #[tokio::main]
 async fn main() {
@@ -9,10 +9,27 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let model_id = std::env::var("WHISPER_MODEL_ID")
+        .unwrap_or_else(|_| rustyecho_inference::DEFAULT_MODEL_ID.to_string());
+    let revision = std::env::var("WHISPER_REVISION")
+        .unwrap_or_else(|_| rustyecho_inference::DEFAULT_REVISION.to_string());
+
+    tracing::info!(model_id, revision, "loading Whisper model");
+    let transcriber = tokio::task::spawn_blocking({
+        let model_id = model_id.clone();
+        let revision = revision.clone();
+        move || WhisperTranscriber::load(&model_id, &revision)
+    })
+    .await
+    .expect("model loading task panicked")
+    .expect("failed to load Whisper model");
+    tracing::info!("model loaded");
+
     let state = AppState {
-        // Phase 1 placeholder swapped for the real `candle` or `whisper-rs`
-        // backed transcriber in Phase 2 without touching any gateway code
-        transcriber: Arc::new(MockTranscriber),
+        // Phase 2 real inference
+        // Swapping backends later like whisper-rs only means changing this line
+        // never gateway code because everything downstream only depends on Transcriber
+        transcriber: Arc::new(transcriber),
         max_upload_bytes: rustyecho_audio::MAX_FILE_BYTES,
     };
 
@@ -27,9 +44,10 @@ async fn main() {
         .await
         .expect("failed to bind port");
 
-    tracing::info!("rustyecho-gateway listening on {}", listener.local_addr().unwrap());
+    tracing::info!(
+        "rustyecho-gateway listening on {}",
+        listener.local_addr().unwrap()
+    );
 
-    axum::serve(listener, app)
-        .await
-        .expect("server error");
+    axum::serve(listener, app).await.expect("server error");
 }
