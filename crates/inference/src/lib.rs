@@ -13,7 +13,10 @@
 //! Multi temperature fallback for when greedy decoding loops or degenerates
 //! is the main quality feature deferred here
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::ops::softmax;
@@ -31,8 +34,15 @@ const MEL_FILTERS_80: &[u8] = include_bytes!("melfilters.bytes");
 pub const DEFAULT_MODEL_ID: &str = "openai/whisper-tiny.en";
 pub const DEFAULT_REVISION: &str = "refs/pr/15";
 
+/// Holds pool_size independent model instances so up to that many
+/// transcriptions can run truly in parallel instead of all serializing
+/// through a single mutex
+/// Dispatch is round robin where request N picks worker N % pool_size
+/// so a burst larger than the pool still queues per worker rather than fanning out further
+/// This is a concurrency ceiling and not a request queue with backpressure or timeouts
 pub struct WhisperTranscriber {
-    inner: Arc<Mutex<Inner>>,
+    workers: Vec<Arc<Mutex<Inner>>>,
+    next: AtomicUsize,
 }
 
 struct Inner {
@@ -50,79 +60,101 @@ struct Inner {
 
 impl WhisperTranscriber {
     /// Downloads or reuses the local Hugging Face cache for model_id at
-    /// revision and loads it into memory
-    /// This is blocking and one time so call this during startup never per request
+    /// revision and loads a single instance into memory which is equivalent to
+    /// load_pool with a size of 1 meaning no concurrency headroom
     pub fn load(model_id: &str, revision: &str) -> anyhow::Result<Self> {
-        let device = Device::Cpu;
+        Self::load_pool(model_id, revision, 1)
+    }
 
-        let api = Api::new()?;
-        let repo = api.repo(Repo::with_revision(
-            model_id.to_string(),
-            RepoType::Model,
-            revision.to_string(),
-        ));
-
-        let config_path = repo.get("config.json")?;
-        let tokenizer_path = repo.get("tokenizer.json")?;
-        let weights_path = repo.get("model.safetensors")?;
-
-        let config: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
-
-        if config.num_mel_bins != 80 {
-            anyhow::bail!(
-                "model expects {} mel bins, but only the bundled 80-bin filter bank is supported",
-                config.num_mel_bins
-            );
-        }
-        let mut mel_filters = vec![0f32; MEL_FILTERS_80.len() / 4];
-        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
-            MEL_FILTERS_80,
-            &mut mel_filters,
-        );
-
-        // Safety the safetensors file comes from a pinned HF Hub revision
-        // we just downloaded ourselves not arbitrary user input
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&[weights_path], m::DTYPE, &device)?
-        };
-        let model = m::model::Whisper::load(&vb, config.clone())?;
-
-        let sot_token = token_id(&tokenizer, m::SOT_TOKEN)?;
-        let eot_token = token_id(&tokenizer, m::EOT_TOKEN)?;
-        let transcribe_token = token_id(&tokenizer, m::TRANSCRIBE_TOKEN)?;
-        let no_timestamps_token = token_id(&tokenizer, m::NO_TIMESTAMPS_TOKEN)?;
-        let no_speech_token = m::NO_SPEECH_TOKENS
-            .iter()
-            .find_map(|token| token_id(&tokenizer, token).ok())
-            .ok_or_else(|| anyhow::anyhow!("no no-speech token found in tokenizer vocab"))?;
-
-        let suppress_tokens: Vec<f32> = (0..config.vocab_size as u32)
-            .map(|i| {
-                if config.suppress_tokens.contains(&i) {
-                    f32::NEG_INFINITY
-                } else {
-                    0f32
-                }
-            })
-            .collect();
-        let suppress_tokens = Tensor::new(suppress_tokens.as_slice(), &device)?;
+    /// Same as load but loads pool_size independent model instances so
+    /// that many requests can be decoded in parallel
+    /// Each instance mmaps the same weights file so the OS page cache shares the read only
+    /// weight pages across instances meaning the actual added memory per extra
+    /// worker is just per instance activation buffers and not another full copy of the weights
+    /// This is blocking and one time so call it during startup and never per request
+    pub fn load_pool(model_id: &str, revision: &str, pool_size: usize) -> anyhow::Result<Self> {
+        let pool_size = pool_size.max(1);
+        let workers = (0..pool_size)
+            .map(|_| Ok(Arc::new(Mutex::new(load_one(model_id, revision)?))))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(Inner {
-                model,
-                tokenizer,
-                device,
-                mel_filters,
-                sot_token,
-                eot_token,
-                transcribe_token,
-                no_timestamps_token,
-                no_speech_token,
-                suppress_tokens,
-            })),
+            workers,
+            next: AtomicUsize::new(0),
         })
     }
+}
+
+/// Downloads or reuses the cached model_id at revision and loads one
+/// instance into memory
+fn load_one(model_id: &str, revision: &str) -> anyhow::Result<Inner> {
+    let device = Device::Cpu;
+
+    let api = Api::new()?;
+    let repo = api.repo(Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        revision.to_string(),
+    ));
+
+    let config_path = repo.get("config.json")?;
+    let tokenizer_path = repo.get("tokenizer.json")?;
+    let weights_path = repo.get("model.safetensors")?;
+
+    let config: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
+
+    if config.num_mel_bins != 80 {
+        anyhow::bail!(
+            "model expects {} mel bins, but only the bundled 80-bin filter bank is supported",
+            config.num_mel_bins
+        );
+    }
+    let mut mel_filters = vec![0f32; MEL_FILTERS_80.len() / 4];
+    <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
+        MEL_FILTERS_80,
+        &mut mel_filters,
+    );
+
+    // Safety the safetensors file comes from a pinned HF Hub revision
+    // we just downloaded ourselves not arbitrary user input
+    let vb = unsafe {
+        candle_nn::VarBuilder::from_mmaped_safetensors(&[weights_path], m::DTYPE, &device)?
+    };
+    let model = m::model::Whisper::load(&vb, config.clone())?;
+
+    let sot_token = token_id(&tokenizer, m::SOT_TOKEN)?;
+    let eot_token = token_id(&tokenizer, m::EOT_TOKEN)?;
+    let transcribe_token = token_id(&tokenizer, m::TRANSCRIBE_TOKEN)?;
+    let no_timestamps_token = token_id(&tokenizer, m::NO_TIMESTAMPS_TOKEN)?;
+    let no_speech_token = m::NO_SPEECH_TOKENS
+        .iter()
+        .find_map(|token| token_id(&tokenizer, token).ok())
+        .ok_or_else(|| anyhow::anyhow!("no no-speech token found in tokenizer vocab"))?;
+
+    let suppress_tokens: Vec<f32> = (0..config.vocab_size as u32)
+        .map(|i| {
+            if config.suppress_tokens.contains(&i) {
+                f32::NEG_INFINITY
+            } else {
+                0f32
+            }
+        })
+        .collect();
+    let suppress_tokens = Tensor::new(suppress_tokens.as_slice(), &device)?;
+
+    Ok(Inner {
+        model,
+        tokenizer,
+        device,
+        mel_filters,
+        sot_token,
+        eot_token,
+        transcribe_token,
+        no_timestamps_token,
+        no_speech_token,
+        suppress_tokens,
+    })
 }
 
 impl Inner {
@@ -210,7 +242,8 @@ fn token_id(tokenizer: &Tokenizer, token: &str) -> anyhow::Result<u32> {
 #[async_trait::async_trait]
 impl Transcriber for WhisperTranscriber {
     async fn transcribe(&self, chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError> {
-        let inner = self.inner.clone();
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        let inner = self.workers[idx].clone();
 
         let text = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut inner = inner.lock().expect("inference mutex poisoned");

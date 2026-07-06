@@ -17,6 +17,14 @@ fn transcriber() -> &'static WhisperTranscriber {
     })
 }
 
+fn pooled_transcriber() -> &'static WhisperTranscriber {
+    static TRANSCRIBER: OnceLock<WhisperTranscriber> = OnceLock::new();
+    TRANSCRIBER.get_or_init(|| {
+        WhisperTranscriber::load_pool(DEFAULT_MODEL_ID, DEFAULT_REVISION, 2)
+            .expect("failed to load Whisper model pool")
+    })
+}
+
 #[tokio::test]
 #[ignore = "downloads a real model from Hugging Face Hub; run with --ignored"]
 async fn transcribes_known_jfk_sample() {
@@ -56,5 +64,47 @@ async fn silence_does_not_hallucinate_text() {
         result.text.trim().is_empty(),
         "expected no-speech gating to suppress hallucinated text on silence, got: {:?}",
         result.text
+    );
+}
+
+/// Regression test for the worker pool fix where with pool_size=2 two
+/// transcriptions running at once should take meaningfully less than 2x a
+/// single one
+/// Before the pool existed a single mutex serialized every
+/// request through one model instance so this would have taken around 2x no
+/// matter how many workers were configured
+#[tokio::test]
+#[ignore = "downloads a real model from Hugging Face Hub; run with --ignored"]
+async fn pool_allows_concurrent_transcriptions() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jfk_sample.wav");
+    let bytes = std::fs::read(path).expect("jfk_sample.wav should exist at repo root");
+    let pcm = rustyecho_audio::decode_wav(&bytes).expect("valid wav");
+
+    let transcriber = pooled_transcriber();
+
+    // Warm up so the timing below is not dominated by one time setup costs
+    let _ = transcriber.transcribe(pcm.clone()).await;
+
+    let single_start = std::time::Instant::now();
+    transcriber
+        .transcribe(pcm.clone())
+        .await
+        .expect("solo transcription should succeed");
+    let single_elapsed = single_start.elapsed();
+
+    let concurrent_start = std::time::Instant::now();
+    let (a, b) = tokio::join!(
+        transcriber.transcribe(pcm.clone()),
+        transcriber.transcribe(pcm.clone()),
+    );
+    a.expect("first concurrent transcription should succeed");
+    b.expect("second concurrent transcription should succeed");
+    let concurrent_elapsed = concurrent_start.elapsed();
+
+    assert!(
+        concurrent_elapsed < single_elapsed * 2,
+        "two concurrent transcriptions took {concurrent_elapsed:?}, a single one took \
+         {single_elapsed:?} -- expected the pool to run them in parallel, not fully \
+         serialize like a single mutex would"
     );
 }

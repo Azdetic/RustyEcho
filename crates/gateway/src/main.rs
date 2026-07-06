@@ -13,12 +13,22 @@ async fn main() {
         .unwrap_or_else(|_| rustyecho_inference::DEFAULT_MODEL_ID.to_string());
     let revision = std::env::var("WHISPER_REVISION")
         .unwrap_or_else(|_| rustyecho_inference::DEFAULT_REVISION.to_string());
+    // How many model instances to load which means how many transcriptions can run
+    // truly in parallel instead of serializing through one mutex
+    // The default of 2 is conservative where each extra instance mmaps the same weights file
+    // shared via the OS page cache but still duplicates its own KV cache
+    // and activation buffers so this should scale with available RAM and CPU
+    // and not be bumped blindly
+    let pool_size: usize = std::env::var("WHISPER_POOL_SIZE")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(2);
 
-    tracing::info!(model_id, revision, "loading Whisper model");
+    tracing::info!(model_id, revision, pool_size, "loading Whisper model");
     let transcriber = tokio::task::spawn_blocking({
         let model_id = model_id.clone();
         let revision = revision.clone();
-        move || WhisperTranscriber::load(&model_id, &revision)
+        move || WhisperTranscriber::load_pool(&model_id, &revision, pool_size)
     })
     .await
     .expect("model loading task panicked")
