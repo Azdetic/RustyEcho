@@ -2,7 +2,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use crate::{routes, state::AppState};
 
@@ -20,5 +20,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/stream", get(routes::stream::stream_handler))
         .layer(RequestBodyLimitLayer::new(max_upload_bytes))
         .layer(TraceLayer::new_for_http())
+        // Permissive for now because there is no auth or cookies yet for a
+        // cross origin request to steal and we will tighten this to an explicit
+        // origin allowlist once Phase 4 adds authentication
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
