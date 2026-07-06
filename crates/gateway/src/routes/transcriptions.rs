@@ -36,7 +36,13 @@ pub async fn create_transcription(
     let pcm = rustyecho_audio::decode_wav(&bytes)?;
     let duration_ms = pcm.duration_ms();
 
-    let result = state.transcriber.transcribe(pcm).await.map_err(GatewayError::from)?;
+    // Single shot batch upload where there is no prior chunk in this session so
+    // there is no cross chunk context to condition on
+    let result = state
+        .transcriber
+        .transcribe(pcm, None)
+        .await
+        .map_err(GatewayError::from)?;
 
     tracing::info!(request_id, duration_ms, "transcription completed");
 

@@ -1,13 +1,17 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
-use rustyecho_core::MockTranscriber;
+use rustyecho_core::{MockTranscriber, PcmBuffer, TranscribeError, TranscriptionResult, Transcriber};
 use rustyecho_gateway::{app::build_router, state::AppState};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 async fn spawn_test_server() -> SocketAddr {
+    spawn_test_server_with(Arc::new(MockTranscriber)).await
+}
+
+async fn spawn_test_server_with(transcriber: Arc<dyn Transcriber>) -> SocketAddr {
     let state = AppState {
-        transcriber: Arc::new(MockTranscriber),
+        transcriber,
         max_upload_bytes: rustyecho_audio::MAX_FILE_BYTES,
     };
     let app = build_router(state);
@@ -147,4 +151,66 @@ async fn stream_rejects_missing_handshake() {
         Ok(Some(Err(_))) | Ok(None) => {}
         Err(_) => panic!("server neither responded nor closed the connection"),
     }
+}
+
+/// Echoes back whatever previous_text it received so tests can prove the
+/// gateway actually threads cross chunk context through independent of any
+/// real ML behavior in rustyecho-inference
+struct ContextEchoTranscriber;
+
+#[async_trait::async_trait]
+impl Transcriber for ContextEchoTranscriber {
+    async fn transcribe(
+        &self,
+        chunk: PcmBuffer,
+        previous_text: Option<&str>,
+    ) -> Result<TranscriptionResult, TranscribeError> {
+        let text = format!(
+            "ctx={}|dur={}",
+            previous_text.unwrap_or("none"),
+            chunk.duration_ms()
+        );
+        Ok(TranscriptionResult {
+            text,
+            is_final: true,
+            confidence: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn stream_passes_previous_chunk_text_as_context_to_next_chunk() {
+    let addr = spawn_test_server_with(Arc::new(ContextEchoTranscriber)).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/stream"))
+        .await
+        .unwrap();
+
+    ws.send(WsMessage::Text(
+        r#"{"type":"start","sample_rate":16000,"channels":1}"#.to_string(),
+    ))
+    .await
+    .unwrap();
+
+    let chunk = {
+        let mut audio = pcm16le_sine(500, 440.0);
+        audio.extend(pcm16le_silence(500));
+        audio
+    };
+
+    // First chunk has no prior context in this session yet
+    ws.send(WsMessage::Binary(chunk.clone())).await.unwrap();
+    let first = next_json(&mut ws).await;
+    assert_eq!(first["type"], "partial");
+    let first_text = first["text"].as_str().unwrap().to_string();
+    assert_eq!(first_text, "ctx=none|dur=1000");
+
+    // Second chunk the gateway should now pass the first chunk
+    // transcribed text back in as previous_text
+    ws.send(WsMessage::Binary(chunk)).await.unwrap();
+    let second = next_json(&mut ws).await;
+    assert_eq!(second["type"], "partial");
+    assert_eq!(
+        second["text"].as_str().unwrap(),
+        format!("ctx={first_text}|dur=1000")
+    );
 }

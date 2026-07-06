@@ -62,6 +62,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 
     let mut vad = EnergyVad::new();
+    // Text from the most recently transcribed non empty chunk in this
+    // session fed back in as Whisper prompt conditioning context on the
+    // next chunk so a word split across a VAD cut is not lost
+    // Reset never happens mid session by design because only the latest chunk text is kept
+    // rather than the full session history to bound memory and the prompt size
+    let mut previous_text: Option<String> = None;
 
     loop {
         let msg = match timeout(IDLE_TIMEOUT, receiver.next()).await {
@@ -76,8 +82,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         match msg {
             Message::Binary(bytes) => {
                 if let Some(chunk) = vad.push(&bytes) {
-                    if emit_result(&state, &mut sender, chunk, false).await.is_err() {
-                        return;
+                    match emit_result(
+                        &state,
+                        &mut sender,
+                        chunk,
+                        false,
+                        previous_text.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(Some(text)) => previous_text = Some(text),
+                        Ok(None) => {}
+                        Err(_) => return,
                     }
                 }
             }
@@ -87,7 +103,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Ok(ClientMessage::Stop)
                 ) {
                     let remaining = vad.take();
-                    let _ = emit_result(&state, &mut sender, remaining, true).await;
+                    let _ = emit_result(
+                        &state,
+                        &mut sender,
+                        remaining,
+                        true,
+                        previous_text.as_deref(),
+                    )
+                    .await;
                     break;
                 }
             }
@@ -211,29 +234,35 @@ fn append_pcm16le(buf: &mut Vec<f32>, bytes: &[u8]) {
     }
 }
 
+/// Sends the transcription result for one chunk and returns the text that
+/// should become previous_text context for the next chunk or None when
+/// there is nothing worth carrying forward like a suppressed empty partial
 async fn emit_result(
     state: &AppState,
     sender: &mut SplitSink<WebSocket, Message>,
     samples: Vec<f32>,
     is_final: bool,
-) -> Result<(), axum::Error> {
+    previous_text: Option<&str>,
+) -> Result<Option<String>, axum::Error> {
     let pcm = PcmBuffer {
         samples,
         format: AudioFormat::TARGET,
     };
 
-    let result = match state.transcriber.transcribe(pcm).await {
+    let result = match state.transcriber.transcribe(pcm, previous_text).await {
         Ok(result) => result,
         Err(rustyecho_core::TranscribeError::Overloaded) => {
-            return send_error(
+            send_error(
                 sender,
                 "OVERLOADED",
                 "server is overloaded, try again shortly",
             )
-            .await;
+            .await?;
+            return Ok(None);
         }
         Err(e) => {
-            return send_error(sender, "TRANSCRIBE_FAILED", &e.to_string()).await;
+            send_error(sender, "TRANSCRIBE_FAILED", &e.to_string()).await?;
+            return Ok(None);
         }
     };
 
@@ -242,15 +271,18 @@ async fn emit_result(
     // gating and we only suppress that for partials because an empty final still
     // tells the client the stream ended
     if !is_final && result.text.trim().is_empty() {
-        return Ok(());
+        return Ok(None);
     }
+
+    let context = (!result.text.trim().is_empty()).then(|| result.text.clone());
 
     let msg = if is_final {
         ServerMessage::Final { text: result.text }
     } else {
         ServerMessage::Partial { text: result.text }
     };
-    sender.send(to_ws_message(&msg)).await
+    sender.send(to_ws_message(&msg)).await?;
+    Ok(context)
 }
 
 async fn send_error(

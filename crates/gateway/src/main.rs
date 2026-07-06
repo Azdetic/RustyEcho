@@ -36,10 +36,11 @@ async fn main() {
     .expect("failed to load Whisper model");
     tracing::info!("model loaded");
 
-    // Cap in-flight requests beyond raw pool capacity so a burst fails fast
+    // Cap in flight requests beyond raw pool capacity so a burst fails fast
     // with 503/OVERLOADED instead of queueing silently and unboundedly on a
-    // busy worker. Slack of 4x pool_size allows short bursts to smooth out;
-    // the wait timeout bounds how long a request sits queued before giving up.
+    // busy worker
+    // Slack of 4x pool_size allows short bursts to smooth out
+    // and the wait timeout bounds how long a request sits queued before giving up
     let max_in_flight = pool_size * 4;
     let queue_timeout_secs: u64 = std::env::var("WHISPER_QUEUE_TIMEOUT_SECS")
         .ok()

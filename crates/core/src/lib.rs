@@ -81,17 +81,26 @@ impl From<TranscribeError> for GatewayError {
 
 #[async_trait::async_trait]
 pub trait Transcriber: Send + Sync {
-    async fn transcribe(&self, chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError>;
+    /// previous_text is whatever text if any came out of the prior chunk
+    /// in the same session where implementations that support it see
+    /// rustyecho-inference Whisper prompt conditioning use it as context
+    /// so words split across a chunk boundary are not lost
+    /// Callers with no notion of a session like the batch REST endpoint pass None
+    async fn transcribe(
+        &self,
+        chunk: PcmBuffer,
+        previous_text: Option<&str>,
+    ) -> Result<TranscriptionResult, TranscribeError>;
 }
 
-/// Wraps any `Transcriber` with a hard cap on in-flight requests, so a burst
-/// beyond that cap fails fast with `TranscribeError::Overloaded` instead of
+/// Wraps any Transcriber with a hard cap on in flight requests so a burst
+/// beyond that cap fails fast with TranscribeError::Overloaded instead of
 /// queueing silently and unboundedly behind whatever concurrency limit the
-/// inner transcriber happens to have (e.g. a worker pool).
+/// inner transcriber happens to have like a worker pool
 ///
-/// A request waits up to `acquire_timeout` for a free slot before giving up
-/// — this bounds worst-case latency under overload instead of leaving
-/// callers to guess how long a request might sit queued.
+/// A request waits up to acquire_timeout for a free slot before giving up
+/// which bounds worst case latency under overload instead of leaving
+/// callers to guess how long a request might sit queued
 pub struct BoundedTranscriber<T> {
     inner: T,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
@@ -110,13 +119,17 @@ impl<T: Transcriber> BoundedTranscriber<T> {
 
 #[async_trait::async_trait]
 impl<T: Transcriber> Transcriber for BoundedTranscriber<T> {
-    async fn transcribe(&self, chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError> {
+    async fn transcribe(
+        &self,
+        chunk: PcmBuffer,
+        previous_text: Option<&str>,
+    ) -> Result<TranscriptionResult, TranscribeError> {
         let _permit = tokio::time::timeout(self.acquire_timeout, self.semaphore.acquire())
             .await
             .map_err(|_| TranscribeError::Overloaded)?
             .expect("semaphore is never closed");
 
-        self.inner.transcribe(chunk).await
+        self.inner.transcribe(chunk, previous_text).await
     }
 }
 
@@ -126,7 +139,11 @@ pub struct MockTranscriber;
 
 #[async_trait::async_trait]
 impl Transcriber for MockTranscriber {
-    async fn transcribe(&self, chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError> {
+    async fn transcribe(
+        &self,
+        chunk: PcmBuffer,
+        _previous_text: Option<&str>,
+    ) -> Result<TranscriptionResult, TranscribeError> {
         Ok(TranscriptionResult {
             text: format!("[mock transcription of {}ms audio]", chunk.duration_ms()),
             is_final: true,
@@ -170,7 +187,7 @@ mod tests {
             samples: vec![0.0; 8_000],
             format: AudioFormat::TARGET,
         };
-        let result = t.transcribe(buf).await.unwrap();
+        let result = t.transcribe(buf, None).await.unwrap();
         assert!(result.is_final);
     }
 
@@ -180,7 +197,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Transcriber for SlowTranscriber {
-        async fn transcribe(&self, _chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError> {
+        async fn transcribe(
+            &self,
+            _chunk: PcmBuffer,
+            _previous_text: Option<&str>,
+        ) -> Result<TranscriptionResult, TranscribeError> {
             tokio::time::sleep(self.delay).await;
             Ok(TranscriptionResult {
                 text: String::new(),
@@ -209,21 +230,21 @@ mod tests {
             Duration::from_millis(50), // much shorter than the slow transcribe
         ));
 
-        // Occupy the only slot for 200ms.
+        // Occupy the only slot for 200ms
         let occupier = {
             let bounded = bounded.clone();
-            tokio::spawn(async move { bounded.transcribe(empty_buf()).await })
+            tokio::spawn(async move { bounded.transcribe(empty_buf(), None).await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        // A second request can't get a permit within 50ms, so it should
-        // fail fast with Overloaded rather than waiting behind the first.
-        let rejected = bounded.transcribe(empty_buf()).await;
+        // A second request cannot get a permit within 50ms so it should
+        // fail fast with Overloaded rather than waiting behind the first
+        let rejected = bounded.transcribe(empty_buf(), None).await;
         assert!(matches!(rejected, Err(TranscribeError::Overloaded)));
 
         // The first request should still complete successfully once its
-        // slot frees up -- saturation rejects new work, it doesn't break
-        // work already in flight.
+        // slot frees up because saturation rejects new work and it does not break
+        // work already in flight
         let occupier_result = occupier.await.unwrap();
         assert!(occupier_result.is_ok());
     }

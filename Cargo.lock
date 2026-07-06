@@ -2176,6 +2176,7 @@ dependencies = [
 name = "rustyecho-gateway"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "futures-util",
  "hound",

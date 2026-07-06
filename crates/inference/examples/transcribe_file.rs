@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     println!("transcribing {path} ({} ms of audio)...", pcm.duration_ms());
     let decode_start = std::time::Instant::now();
     let result = transcriber
-        .transcribe(pcm)
+        .transcribe(pcm, None)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 

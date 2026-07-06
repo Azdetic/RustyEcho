@@ -33,7 +33,7 @@ async fn transcribes_known_jfk_sample() {
     let pcm = rustyecho_audio::decode_wav(&bytes).expect("valid wav");
 
     let result = transcriber()
-        .transcribe(pcm)
+        .transcribe(pcm, None)
         .await
         .expect("transcription should succeed");
 
@@ -56,7 +56,7 @@ async fn silence_does_not_hallucinate_text() {
     };
 
     let result = transcriber()
-        .transcribe(pcm)
+        .transcribe(pcm, None)
         .await
         .expect("transcription should succeed");
 
@@ -83,19 +83,19 @@ async fn pool_allows_concurrent_transcriptions() {
     let transcriber = pooled_transcriber();
 
     // Warm up so the timing below is not dominated by one time setup costs
-    let _ = transcriber.transcribe(pcm.clone()).await;
+    let _ = transcriber.transcribe(pcm.clone(), None).await;
 
     let single_start = std::time::Instant::now();
     transcriber
-        .transcribe(pcm.clone())
+        .transcribe(pcm.clone(), None)
         .await
         .expect("solo transcription should succeed");
     let single_elapsed = single_start.elapsed();
 
     let concurrent_start = std::time::Instant::now();
     let (a, b) = tokio::join!(
-        transcriber.transcribe(pcm.clone()),
-        transcriber.transcribe(pcm.clone()),
+        transcriber.transcribe(pcm.clone(), None),
+        transcriber.transcribe(pcm.clone(), None),
     );
     a.expect("first concurrent transcription should succeed");
     b.expect("second concurrent transcription should succeed");
@@ -106,5 +106,48 @@ async fn pool_allows_concurrent_transcriptions() {
         "two concurrent transcriptions took {concurrent_elapsed:?}, a single one took \
          {single_elapsed:?} -- expected the pool to run them in parallel, not fully \
          serialize like a single mutex would"
+    );
+}
+
+/// Sanity check for the cross chunk context feature where supplying benign
+/// previous chunk context should not corrupt an otherwise well known
+/// transcript
+#[tokio::test]
+#[ignore = "downloads a real model from Hugging Face Hub; run with --ignored"]
+async fn context_conditioning_does_not_corrupt_transcription() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jfk_sample.wav");
+    let bytes = std::fs::read(path).expect("jfk_sample.wav should exist at repo root");
+    let pcm = rustyecho_audio::decode_wav(&bytes).expect("valid wav");
+
+    let result = transcriber()
+        .transcribe(pcm, Some("Good morning, everyone."))
+        .await
+        .expect("transcription should succeed");
+
+    let text = result.text.to_lowercase();
+    assert!(
+        text.contains("ask not what your country"),
+        "context conditioning should not corrupt the known-good transcript: {text}"
+    );
+}
+
+/// Regression test for the token budget fix where previous_text longer than the
+/// model context window must be truncated keeping the most recent
+/// tokens and not overflow max_target_positions and fail the decode
+#[tokio::test]
+#[ignore = "downloads a real model from Hugging Face Hub; run with --ignored"]
+async fn long_previous_text_is_truncated_not_rejected() {
+    let long_context = "the quick brown fox jumps over the lazy dog ".repeat(100);
+    let pcm = PcmBuffer {
+        samples: vec![0.0; AudioFormat::TARGET.sample_rate as usize * 2],
+        format: AudioFormat::TARGET,
+    };
+
+    let result = transcriber().transcribe(pcm, Some(&long_context)).await;
+
+    assert!(
+        result.is_ok(),
+        "expected long previous_text to be truncated to fit the model's context \
+         window, not cause a decode error: {result:?}"
     );
 }

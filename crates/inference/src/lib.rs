@@ -55,6 +55,7 @@ struct Inner {
     transcribe_token: u32,
     no_timestamps_token: u32,
     no_speech_token: u32,
+    prev_token: u32,
     suppress_tokens: Tensor,
 }
 
@@ -131,6 +132,9 @@ fn load_one(model_id: &str, revision: &str) -> anyhow::Result<Inner> {
         .iter()
         .find_map(|token| token_id(&tokenizer, token).ok())
         .ok_or_else(|| anyhow::anyhow!("no no-speech token found in tokenizer vocab"))?;
+    // Used to prefix previous chunk context onto the decode prompt see
+    // Inner::decode so words split across a VAD chunk boundary are not lost
+    let prev_token = token_id(&tokenizer, "<|startofprev|>")?;
 
     let suppress_tokens: Vec<f32> = (0..config.vocab_size as u32)
         .map(|i| {
@@ -153,6 +157,7 @@ fn load_one(model_id: &str, revision: &str) -> anyhow::Result<Inner> {
         transcribe_token,
         no_timestamps_token,
         no_speech_token,
+        prev_token,
         suppress_tokens,
     })
 }
@@ -161,12 +166,18 @@ impl Inner {
     /// Greedy decodes a single chunk where samples must already be normalized
     /// -1.0..=1.0 mono PCM at 16kHz which is exactly what PcmBuffer guarantees
     ///
+    /// previous_text when given is prepended as startofprev conditioned
+    /// context which is the same mechanism as OpenAI condition_on_previous_text so the
+    /// model has a chance to continue a word or sentence that got cut off at
+    /// the previous chunk boundary rather than decoding each chunk in total
+    /// isolation
+    ///
     /// Returns an empty string when the audio looks like silence or noise rather
     /// than speech where no_speech_prob is over NO_SPEECH_THRESHOLD just like the
     /// reference decoder because without this check Whisper never says nothing was
     /// said but instead confidently hallucinates plausible text for silent or noisy
     /// chunks
-    fn decode(&mut self, samples: &[f32]) -> anyhow::Result<String> {
+    fn decode(&mut self, samples: &[f32], previous_text: Option<&str>) -> anyhow::Result<String> {
         let num_mel_bins = self.model.config.num_mel_bins;
         let mel = audio::pcm_to_mel(&self.model.config, samples, &self.mel_filters);
         let mel_len = mel.len();
@@ -179,7 +190,31 @@ impl Inner {
         let audio_features = self.model.encoder.forward(&mel, true)?;
 
         let sample_len = self.model.config.max_target_positions / 2;
-        let mut tokens = vec![self.sot_token, self.transcribe_token, self.no_timestamps_token];
+
+        let mut tokens: Vec<u32> = Vec::new();
+        if let Some(prev) = previous_text.map(str::trim).filter(|s| !s.is_empty()) {
+            let prev_ids = self
+                .tokenizer
+                .encode(prev, false)
+                .map_err(anyhow::Error::msg)?;
+            let prev_ids = prev_ids.get_ids();
+            // Total sequence length prompt plus sot sequence plus generated must
+            // stay within max_target_positions or the position embedding
+            // lookup goes out of bounds
+            // We reserve prev_token plus the 3 sot sequence tokens plus this call up to sample_len generation
+            // budget with a small safety margin before capping the prompt
+            let max_prev_tokens = sample_len.saturating_sub(8);
+            let start = prev_ids.len().saturating_sub(max_prev_tokens);
+            tokens.push(self.prev_token);
+            tokens.extend_from_slice(&prev_ids[start..]);
+        }
+        // Position of sot_token within tokens shifts when a prompt is
+        // prepended so no speech detection below reads logits from here and not
+        // always index 0 matching how the OpenAI reference decoder does it
+        let sot_index = tokens.len();
+        tokens.push(self.sot_token);
+        tokens.push(self.transcribe_token);
+        tokens.push(self.no_timestamps_token);
 
         for i in 0..sample_len {
             let tokens_t = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
@@ -187,13 +222,15 @@ impl Inner {
 
             if i == 0 {
                 // Logits right after startoftranscript before the
-                // transcribe and no_timestamps tokens are seen which is the
-                // position OpenAI reference decoder reads no speech
-                // probability from
+                // transcribe and no_timestamps tokens are seen which is the position
+                // the OpenAI reference decoder reads no speech probability
+                // from
+                // Causal attention still lets this position see any
+                // prepended previous text context matching upstream
                 let first_step_logits = self
                     .model
                     .decoder
-                    .final_linear(&ys.i((..1, 0..1))?)?
+                    .final_linear(&ys.i((..1, sot_index..sot_index + 1))?)?
                     .i(0)?
                     .i(0)?;
                 let no_speech_prob = softmax(&first_step_logits, 0)?
@@ -227,8 +264,10 @@ impl Inner {
             }
         }
 
+        // Only decode the tokens generated for this chunk and not the prepended
+        // previous text prompt because that part is not new output
         self.tokenizer
-            .decode(&tokens, true)
+            .decode(&tokens[sot_index..], true)
             .map_err(anyhow::Error::msg)
     }
 }
@@ -241,13 +280,18 @@ fn token_id(tokenizer: &Tokenizer, token: &str) -> anyhow::Result<u32> {
 
 #[async_trait::async_trait]
 impl Transcriber for WhisperTranscriber {
-    async fn transcribe(&self, chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError> {
+    async fn transcribe(
+        &self,
+        chunk: PcmBuffer,
+        previous_text: Option<&str>,
+    ) -> Result<TranscriptionResult, TranscribeError> {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let inner = self.workers[idx].clone();
+        let previous_text = previous_text.map(str::to_owned);
 
         let text = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut inner = inner.lock().expect("inference mutex poisoned");
-            inner.decode(&chunk.samples)
+            inner.decode(&chunk.samples, previous_text.as_deref())
         })
         .await
         .map_err(|e| TranscribeError::Backend(e.to_string()))?
