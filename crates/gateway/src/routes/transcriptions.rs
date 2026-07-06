@@ -36,11 +36,7 @@ pub async fn create_transcription(
     let pcm = rustyecho_audio::decode_wav(&bytes)?;
     let duration_ms = pcm.duration_ms();
 
-    let result = state
-        .transcriber
-        .transcribe(pcm)
-        .await
-        .map_err(|e| GatewayError::TranscribeFailed(e.to_string()))?;
+    let result = state.transcriber.transcribe(pcm).await.map_err(GatewayError::from)?;
 
     tracing::info!(request_id, duration_ms, "transcription completed");
 

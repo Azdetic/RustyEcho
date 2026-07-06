@@ -58,17 +58,66 @@ pub enum GatewayError {
     Timeout,
     #[error("transcription failed: {0}")]
     TranscribeFailed(String),
+    #[error("service overloaded, try again shortly")]
+    Overloaded,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum TranscribeError {
     #[error("transcription backend error: {0}")]
     Backend(String),
+    #[error("transcription backend is overloaded")]
+    Overloaded,
+}
+
+impl From<TranscribeError> for GatewayError {
+    fn from(err: TranscribeError) -> Self {
+        match err {
+            TranscribeError::Overloaded => GatewayError::Overloaded,
+            TranscribeError::Backend(msg) => GatewayError::TranscribeFailed(msg),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 pub trait Transcriber: Send + Sync {
     async fn transcribe(&self, chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError>;
+}
+
+/// Wraps any `Transcriber` with a hard cap on in-flight requests, so a burst
+/// beyond that cap fails fast with `TranscribeError::Overloaded` instead of
+/// queueing silently and unboundedly behind whatever concurrency limit the
+/// inner transcriber happens to have (e.g. a worker pool).
+///
+/// A request waits up to `acquire_timeout` for a free slot before giving up
+/// — this bounds worst-case latency under overload instead of leaving
+/// callers to guess how long a request might sit queued.
+pub struct BoundedTranscriber<T> {
+    inner: T,
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    acquire_timeout: std::time::Duration,
+}
+
+impl<T: Transcriber> BoundedTranscriber<T> {
+    pub fn new(inner: T, max_in_flight: usize, acquire_timeout: std::time::Duration) -> Self {
+        Self {
+            inner,
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_in_flight.max(1))),
+            acquire_timeout,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: Transcriber> Transcriber for BoundedTranscriber<T> {
+    async fn transcribe(&self, chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError> {
+        let _permit = tokio::time::timeout(self.acquire_timeout, self.semaphore.acquire())
+            .await
+            .map_err(|_| TranscribeError::Overloaded)?
+            .expect("semaphore is never closed");
+
+        self.inner.transcribe(chunk).await
+    }
 }
 
 /// Placeholder used throughout Phase 1 so the I/O pipeline can be built and
@@ -123,5 +172,59 @@ mod tests {
         };
         let result = t.transcribe(buf).await.unwrap();
         assert!(result.is_final);
+    }
+
+    struct SlowTranscriber {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Transcriber for SlowTranscriber {
+        async fn transcribe(&self, _chunk: PcmBuffer) -> Result<TranscriptionResult, TranscribeError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(TranscriptionResult {
+                text: String::new(),
+                is_final: true,
+                confidence: None,
+            })
+        }
+    }
+
+    fn empty_buf() -> PcmBuffer {
+        PcmBuffer {
+            samples: vec![],
+            format: AudioFormat::TARGET,
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_transcriber_rejects_when_saturated() {
+        use std::{sync::Arc, time::Duration};
+
+        let bounded = Arc::new(BoundedTranscriber::new(
+            SlowTranscriber {
+                delay: Duration::from_millis(200),
+            },
+            1, // only one in-flight request allowed
+            Duration::from_millis(50), // much shorter than the slow transcribe
+        ));
+
+        // Occupy the only slot for 200ms.
+        let occupier = {
+            let bounded = bounded.clone();
+            tokio::spawn(async move { bounded.transcribe(empty_buf()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // A second request can't get a permit within 50ms, so it should
+        // fail fast with Overloaded rather than waiting behind the first.
+        let rejected = bounded.transcribe(empty_buf()).await;
+        assert!(matches!(rejected, Err(TranscribeError::Overloaded)));
+
+        // The first request should still complete successfully once its
+        // slot frees up -- saturation rejects new work, it doesn't break
+        // work already in flight.
+        let occupier_result = occupier.await.unwrap();
+        assert!(occupier_result.is_ok());
     }
 }

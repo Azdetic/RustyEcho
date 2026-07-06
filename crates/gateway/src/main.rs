@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
+use rustyecho_core::BoundedTranscriber;
 use rustyecho_gateway::{app::build_router, state::AppState};
 use rustyecho_inference::WhisperTranscriber;
 
@@ -34,6 +35,21 @@ async fn main() {
     .expect("model loading task panicked")
     .expect("failed to load Whisper model");
     tracing::info!("model loaded");
+
+    // Cap in-flight requests beyond raw pool capacity so a burst fails fast
+    // with 503/OVERLOADED instead of queueing silently and unboundedly on a
+    // busy worker. Slack of 4x pool_size allows short bursts to smooth out;
+    // the wait timeout bounds how long a request sits queued before giving up.
+    let max_in_flight = pool_size * 4;
+    let queue_timeout_secs: u64 = std::env::var("WHISPER_QUEUE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let transcriber = BoundedTranscriber::new(
+        transcriber,
+        max_in_flight,
+        Duration::from_secs(queue_timeout_secs),
+    );
 
     let state = AppState {
         // Phase 2 real inference

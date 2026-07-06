@@ -30,6 +30,7 @@ impl IntoResponse for ApiError {
             GatewayError::TranscribeFailed(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "TRANSCRIBE_FAILED")
             }
+            GatewayError::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "OVERLOADED"),
         };
 
         let body = Json(json!({

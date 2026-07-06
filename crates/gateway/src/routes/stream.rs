@@ -224,6 +224,14 @@ async fn emit_result(
 
     let result = match state.transcriber.transcribe(pcm).await {
         Ok(result) => result,
+        Err(rustyecho_core::TranscribeError::Overloaded) => {
+            return send_error(
+                sender,
+                "OVERLOADED",
+                "server is overloaded, try again shortly",
+            )
+            .await;
+        }
         Err(e) => {
             return send_error(sender, "TRANSCRIBE_FAILED", &e.to_string()).await;
         }
