@@ -16,6 +16,7 @@
 use std::sync::{Arc, Mutex};
 
 use candle_core::{Device, IndexOp, Tensor};
+use candle_nn::ops::softmax;
 use candle_transformers::models::whisper::{self as m, audio, Config};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use rustyecho_core::{PcmBuffer, TranscribeError, TranscriptionResult, Transcriber};
@@ -43,6 +44,7 @@ struct Inner {
     eot_token: u32,
     transcribe_token: u32,
     no_timestamps_token: u32,
+    no_speech_token: u32,
     suppress_tokens: Tensor,
 }
 
@@ -90,6 +92,10 @@ impl WhisperTranscriber {
         let eot_token = token_id(&tokenizer, m::EOT_TOKEN)?;
         let transcribe_token = token_id(&tokenizer, m::TRANSCRIBE_TOKEN)?;
         let no_timestamps_token = token_id(&tokenizer, m::NO_TIMESTAMPS_TOKEN)?;
+        let no_speech_token = m::NO_SPEECH_TOKENS
+            .iter()
+            .find_map(|token| token_id(&tokenizer, token).ok())
+            .ok_or_else(|| anyhow::anyhow!("no no-speech token found in tokenizer vocab"))?;
 
         let suppress_tokens: Vec<f32> = (0..config.vocab_size as u32)
             .map(|i| {
@@ -112,6 +118,7 @@ impl WhisperTranscriber {
                 eot_token,
                 transcribe_token,
                 no_timestamps_token,
+                no_speech_token,
                 suppress_tokens,
             })),
         })
@@ -121,6 +128,12 @@ impl WhisperTranscriber {
 impl Inner {
     /// Greedy decodes a single chunk where samples must already be normalized
     /// -1.0..=1.0 mono PCM at 16kHz which is exactly what PcmBuffer guarantees
+    ///
+    /// Returns an empty string when the audio looks like silence or noise rather
+    /// than speech where no_speech_prob is over NO_SPEECH_THRESHOLD just like the
+    /// reference decoder because without this check Whisper never says nothing was
+    /// said but instead confidently hallucinates plausible text for silent or noisy
+    /// chunks
     fn decode(&mut self, samples: &[f32]) -> anyhow::Result<String> {
         let num_mel_bins = self.model.config.num_mel_bins;
         let mel = audio::pcm_to_mel(&self.model.config, samples, &self.mel_filters);
@@ -139,6 +152,26 @@ impl Inner {
         for i in 0..sample_len {
             let tokens_t = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
             let ys = self.model.decoder.forward(&tokens_t, &audio_features, i == 0)?;
+
+            if i == 0 {
+                // Logits right after startoftranscript before the
+                // transcribe and no_timestamps tokens are seen which is the
+                // position OpenAI reference decoder reads no speech
+                // probability from
+                let first_step_logits = self
+                    .model
+                    .decoder
+                    .final_linear(&ys.i((..1, 0..1))?)?
+                    .i(0)?
+                    .i(0)?;
+                let no_speech_prob = softmax(&first_step_logits, 0)?
+                    .i(self.no_speech_token as usize)?
+                    .to_scalar::<f32>()?;
+                if no_speech_prob as f64 > m::NO_SPEECH_THRESHOLD {
+                    return Ok(String::new());
+                }
+            }
+
             let (_, seq_len, _) = ys.dims3()?;
             let logits = self
                 .model

@@ -229,6 +229,14 @@ async fn emit_result(
         }
     };
 
+    // A Transcriber returns an empty string when a chunk turns out to be
+    // silence or noise rather than speech see rustyecho-inference no speech
+    // gating and we only suppress that for partials because an empty final still
+    // tells the client the stream ended
+    if !is_final && result.text.trim().is_empty() {
+        return Ok(());
+    }
+
     let msg = if is_final {
         ServerMessage::Final { text: result.text }
     } else {
