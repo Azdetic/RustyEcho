@@ -21,7 +21,7 @@ use std::sync::{
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::ops::softmax;
 use candle_transformers::models::whisper::{self as m, audio, Config};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use rustyecho_core::{PcmBuffer, TranscribeError, TranscriptionResult, Transcriber};
 use tokenizers::Tokenizer;
 
@@ -91,7 +91,11 @@ impl WhisperTranscriber {
 fn load_one(model_id: &str, revision: &str) -> anyhow::Result<Inner> {
     let device = Device::Cpu;
 
-    let api = Api::new()?;
+    // `Api::new()` ignores `HF_HOME` (it uses `Cache::default()`, not
+    // `Cache::from_env()`) -- `from_env()` is required for the cache
+    // location to actually be overridable, which the Docker build relies on
+    // to pre-warm a cache directory that gets copied into the runtime image.
+    let api = ApiBuilder::from_env().build()?;
     let repo = api.repo(Repo::with_revision(
         model_id.to_string(),
         RepoType::Model,
