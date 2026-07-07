@@ -70,9 +70,14 @@ const ENCODER_POSITIONS_PER_SEC: usize = 50;
 /// to be reasonably reliable on real speech.
 const LANGUAGE_WINDOW_POSITIONS: usize = ENCODER_POSITIONS_PER_SEC * 3 / 2; // 1.5s
 /// A trailing remainder shorter than this gets folded into the previous
-/// window instead of being language-detected on its own -- too short to be
-/// a reliable language signal by itself.
+/// window instead of being language detected on its own because it is too short to be
+/// a reliable language signal by itself
 const MIN_LANGUAGE_WINDOW_POSITIONS: usize = ENCODER_POSITIONS_PER_SEC / 2; // 0.5s
+/// A window detected language only overrides the running language if its
+/// confidence is at least this high
+/// Measured on a real pure English clip genuine language windows scored 0.92 to 0.99
+/// while classifier blips that picked the wrong language scored 0.30 and 0.45 which is comfortably below this
+const LANGUAGE_SWITCH_CONFIDENCE_THRESHOLD: f32 = 0.6;
 
 /// Holds pool_size independent model instances so up to that many
 /// transcriptions can run truly in parallel instead of all serializing
@@ -327,22 +332,38 @@ impl Inner {
             }
         }
 
-        let mut windows: Vec<(usize, usize, u32)> = Vec::with_capacity(boundaries.len());
+        // Raw per window detections before confidence smoothing
+        // Measured on a real pure English 11s clip most windows landed at 0.92 to 0.99
+        // confidence for English but two windows dipped to 0.45 and 0.30
+        // and flipped to a different language at that low confidence which was
+        // a classifier blip and not a real switch
+        // Smoothing below only trusts a language change when it is confident about it
+        // A low confidence window is treated as probably still whatever state it was in
+        let mut windows: Vec<(usize, usize, u32, f32)> = Vec::with_capacity(boundaries.len());
         for pair in boundaries.windows(2) {
             let (start, end) = (pair[0], pair[1]);
             let slice = audio_features.narrow(1, start, end - start)?.contiguous()?;
             let (token, confidence) = self.detect_language_token(&slice)?;
             tracing::debug!(start, end, token, confidence, "language window detected");
-            windows.push((start, end, token));
+            windows.push((start, end, token, confidence));
         }
 
+        let mut current_language: Option<u32> = None;
         let mut merged: Vec<(usize, usize, u32)> = Vec::with_capacity(windows.len());
-        for (start, end, token) in windows {
+        for (start, end, token, confidence) in windows {
+            let effective_token = match current_language {
+                Some(current) if token != current && confidence < LANGUAGE_SWITCH_CONFIDENCE_THRESHOLD => {
+                    current
+                }
+                _ => token,
+            };
+            current_language = Some(effective_token);
+
             match merged.last_mut() {
-                Some((_, last_end, last_token)) if *last_token == token => {
+                Some((_, last_end, last_token)) if *last_token == effective_token => {
                     *last_end = end;
                 }
-                _ => merged.push((start, end, token)),
+                _ => merged.push((start, end, effective_token)),
             }
         }
         Ok(merged)
