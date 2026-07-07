@@ -25,6 +25,10 @@ fn pooled_transcriber() -> &'static WhisperTranscriber {
     })
 }
 
+/// Also a regression test for language auto-detection: DEFAULT_MODEL_ID is
+/// a multilingual model, so this only passes if auto-detect correctly picks
+/// English for this clip -- a wrong language pick would produce garbled or
+/// wrong-script output that would fail the assertion below.
 #[tokio::test]
 #[ignore = "downloads a real model from Hugging Face Hub; run with --ignored"]
 async fn transcribes_known_jfk_sample() {
@@ -41,6 +45,47 @@ async fn transcribes_known_jfk_sample() {
     assert!(
         text.contains("ask not what your country"),
         "unexpected transcription: {text}"
+    );
+}
+
+/// Proves language auto-detection actually adapts per chunk instead of
+/// sticking to whatever language it saw first in a session: the same
+/// shared transcriber decodes a real English clip then a real Indonesian
+/// clip in sequence, and each must come out in its own language.
+#[tokio::test]
+#[ignore = "downloads a real model from Hugging Face Hub; run with --ignored"]
+async fn detects_language_switch_within_one_session() {
+    let jfk_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jfk_sample.wav");
+    let jfk_bytes = std::fs::read(jfk_path).expect("jfk_sample.wav should exist at repo root");
+    let jfk_pcm = rustyecho_audio::decode_wav(&jfk_bytes).expect("valid wav");
+
+    let id_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../id_sample1.wav");
+    let id_bytes = std::fs::read(id_path).expect("id_sample1.wav should exist at repo root");
+    let id_pcm = rustyecho_audio::decode_wav(&id_bytes).expect("valid wav");
+
+    let shared = transcriber();
+
+    let english_result = shared
+        .transcribe(jfk_pcm, None)
+        .await
+        .expect("english transcription should succeed");
+    assert!(
+        english_result
+            .text
+            .to_lowercase()
+            .contains("ask not what your country"),
+        "expected English transcript, got: {}",
+        english_result.text
+    );
+
+    let indonesian_result = shared
+        .transcribe(id_pcm, None)
+        .await
+        .expect("indonesian transcription should succeed");
+    assert!(
+        indonesian_result.text.to_lowercase().contains("dunia"),
+        "expected Indonesian transcript mentioning 'dunia', got: {}",
+        indonesian_result.text
     );
 }
 

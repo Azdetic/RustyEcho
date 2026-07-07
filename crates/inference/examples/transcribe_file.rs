@@ -12,6 +12,10 @@ use rustyecho_core::Transcriber;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "jfk_sample.wav".to_string());
